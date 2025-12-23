@@ -8,7 +8,7 @@
 #define SHORT_TTL_IF 1000
 #define PING_MIN_USER_INTERVAL (0.2)
 #define EXIT_FAILURE 1
-#define EXIT_FAILLURE_USAGE 64
+#define EXIT_FAILURE_USAGE 64
 
 #define exit_on_error(code, usage_msg, fmt, ...) do { \
     fprintf(stderr, "ping: "); \
@@ -24,9 +24,9 @@ typedef struct s_ping {
     bool        help;
     bool        flood;
     bool        numeric_only;
-    int         count;
-    int         time_to_live;
+    char         time_to_live;
     double      interval;
+    size_t      count;
     char        *target;
 } t_ping;
 
@@ -104,9 +104,9 @@ static void parse_args(int ac, char **av)
             case '?':
 
                 if (optopt != 0) 
-                    exit_on_error(EXIT_FAILLURE_USAGE, true, "invalid option -- '%c'", optopt);
+                    exit_on_error(EXIT_FAILURE_USAGE, true, "invalid option -- '%c'", optopt);
                 if (av[optind - 1] && av[optind - 1][0] == '-' && av[optind - 1][1] == '-')
-                    exit_on_error(EXIT_FAILLURE_USAGE, true, "unrecognized option '%s'", av[optind - 1]);
+                    exit_on_error(EXIT_FAILURE_USAGE, true, "unrecognized option '%s'", av[optind - 1]);
 
                 print_help();
                 exit(0);
@@ -117,7 +117,7 @@ static void parse_args(int ac, char **av)
                 errno = 0;
                 flags.interval = strtod(optarg, &endptr);
                 if (*endptr)
-                    exit_on_error(EXIT_FAILLURE_USAGE, true, "invalid value (`%s' near `%s')", optarg, endptr);
+                    exit_on_error(EXIT_FAILURE_USAGE, true, "invalid value (`%s' near `%s')", optarg, endptr);
                 if (flags.interval < PING_MIN_USER_INTERVAL)
                     exit_on_error(EXIT_FAILURE, false, "option value too small: %s", optarg);
                 if (errno == ERANGE || flags.interval > INT_MAX)
@@ -127,9 +127,22 @@ static void parse_args(int ac, char **av)
                 break;
 
             case 'c':
-                flags.count = strtol(optarg, &endptr, 10);
+                long count = strtol(optarg, &endptr, 10);
+                if (count < 0)
+                    count = 0;
                 if (*endptr)
-                    exit_on_error(EXIT_FAILLURE_USAGE, true, "invalid value (`%s' near `%s')", optarg, endptr);
+                    exit_on_error(EXIT_FAILURE_USAGE, true, "invalid value (`%s' near `%s')", optarg, endptr);
+                flags.count = (errno == ERANGE ? -1 : count);
+            break;
+
+            case SHORT_TTL_IF:
+                errno = 0;
+                unsigned long ttl = strtoul(optarg, &endptr, 10);
+                if (*endptr)
+                    exit_on_error(EXIT_FAILURE_USAGE, true, "invalid value (`%s' near `%s')", optarg, endptr);
+                if (errno == ERANGE || ttl > 255)
+                    exit_on_error(EXIT_FAILURE, false, "option value too big: %s", optarg);
+                flags.time_to_live = (int)ttl;
             break;
 
             default:
@@ -140,7 +153,7 @@ static void parse_args(int ac, char **av)
     if (optind < ac)
         flags.target = av[optind];
     else
-        exit_on_error(EXIT_FAILLURE_USAGE, true, "missing host operand");
+        exit_on_error(EXIT_FAILURE_USAGE, true, "missing host operand");
 
 }
 
