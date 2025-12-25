@@ -23,8 +23,11 @@
 
 [ ] Main function and logic
     [x] DNS (getaddrinfo) : Transformer "google.com" en IP
-    [ ] Raw Sockets : Créer le socket, gérer les permissions root  
+    [x] Raw Sockets : Créer le socket, gérer les permissions root  
     [ ] ICMP Protocol : Construire les paquets à la main (Header, Data, Sequence, ID)  
     [ ] Checksum : L'algorithme de vérification (bit à bit)
     [ ] Signal Handler : Gérer le Ctrl+C proprement pour afficher les stats à la fin 
     [ ] Timing : Calculer le RTT (Round Trip Time) avec précision
+
+
+https://ekman.cx/articles/icmp_sockets/

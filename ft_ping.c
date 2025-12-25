@@ -9,6 +9,9 @@
 #include <unistd.h>
 #include <netdb.h>
 #include <string.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/time.h>
 
 #define SHORT_TTL_IF 1000
 #define PING_MIN_USER_INTERVAL (0.2)
@@ -34,9 +37,16 @@ typedef struct s_ping {
     double      interval;
     size_t      count;
     char        *target;
-} t_ping;
+} t_ping_flg;
 
-t_ping flags = {
+typedef struct s_ping_context {
+    struct sockaddr_in  addr;
+    socklen_t           addr_len;
+    char                ipv4[INET_ADDRSTRLEN];
+    int                 sockfd;
+} t_ping_context;
+
+t_ping_flg flags = {
     .verbose = false,
     .help = false,
     .flood = false,
@@ -47,6 +57,8 @@ t_ping flags = {
     .interval = 1,
     .target = NULL
 };
+
+t_ping_context ctx = {0};
 
 static struct option long_options[] = {
     {"verbose",         no_argument,        0, 'v'},
@@ -166,14 +178,14 @@ static void parse_args(int ac, char **av)
 
 }
 
-struct sockaddr *resolve_dns(char *target)
+void    resolve_dns(char *target)
 {
     int ret_code;
-    struct sockaddr *ret_addr;
+
     struct addrinfo *result;
     struct addrinfo hints = {
         .ai_family = AF_INET,       // Force ipv4 address
-        .ai_socktype = SOCK_RAW,    // Raw socket required to manually build icmp headers
+        .ai_socktype = SOCK_RAW,    // Raw socket required to build icmp headers
         .ai_protocol = IPPROTO_ICMP // Use icmp protocol
     };
 
@@ -181,19 +193,30 @@ struct sockaddr *resolve_dns(char *target)
     if (ret_code != 0)
         exit_on_error(EXIT_FAILURE, false, "getaddrinfo: %s\n",  gai_strerror(ret_code));
 
-    ret_addr = malloc(result->ai_addrlen);
-    if (!ret_addr)
-        exit_on_error(EXIT_FAILURE, false, "malloc failed");
+    ctx.addr_len = result->ai_addrlen;
 
-    memcpy(ret_addr, result->ai_addr, result->ai_addrlen);
+    memcpy(&ctx.addr, result->ai_addr, ctx.addr_len);
     freeaddrinfo(result);
-
-    return ret_addr;
+    inet_ntop(AF_INET, &(ctx.addr.sin_addr), ctx.ipv4, INET_ADDRSTRLEN);
 }
 
 int main(int ac, char **av)
 {
     parse_args(ac, av);
-    struct sockaddr *addr_to_send = resolve_dns(flags.target);
+    resolve_dns(flags.target);
+    
+    // Socket creation
+    ctx.sockfd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    if (ctx.sockfd == -1)
+        exit_on_error(EXIT_FAILURE, false, "Error: cannot create the socket.");
+    if (flags.time_to_live > 0)
+        setsockopt(ctx.sockfd, IPPROTO_IP, IP_TTL, &flags.time_to_live, sizeof(flags.time_to_live));
+    struct timeval timeout = {.tv_sec = 1, .tv_usec = 0};
+    setsockopt(ctx.sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+
+
+    printf("Target: %s\n", flags.target);
+    printf("Resolved IP: %s\n", ctx.ipv4);
     return 0;
 }
