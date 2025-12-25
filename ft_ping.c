@@ -4,6 +4,11 @@
 #include <errno.h>
 #include <getopt.h>
 #include <limits.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <netdb.h>
+#include <string.h>
 
 #define SHORT_TTL_IF 1000
 #define PING_MIN_USER_INTERVAL (0.2)
@@ -24,7 +29,8 @@ typedef struct s_ping {
     bool        help;
     bool        flood;
     bool        numeric_only;
-    char         time_to_live;
+    bool        is_root;
+    int         time_to_live;
     double      interval;
     size_t      count;
     char        *target;
@@ -35,6 +41,7 @@ t_ping flags = {
     .help = false,
     .flood = false,
     .numeric_only = false,
+    .is_root = false,
     .count = 0,
     .time_to_live = 0,
     .interval = 1,
@@ -78,6 +85,8 @@ static void parse_args(int ac, char **av)
     int opt;
 
     opterr = 0;
+    if (getuid () == 0)
+        flags.is_root = true;
     while (true)
     {
         char *endptr;
@@ -114,16 +123,16 @@ static void parse_args(int ac, char **av)
                 break;
 
             case 'i':
+                if (flags.interval == 0)
+                    exit_on_error(EXIT_FAILURE, false, "-f and -i incompatible options");
                 errno = 0;
                 flags.interval = strtod(optarg, &endptr);
                 if (*endptr)
                     exit_on_error(EXIT_FAILURE_USAGE, true, "invalid value (`%s' near `%s')", optarg, endptr);
-                if (flags.interval < PING_MIN_USER_INTERVAL)
+                if (flags.interval < PING_MIN_USER_INTERVAL && !flags.is_root)
                     exit_on_error(EXIT_FAILURE, false, "option value too small: %s", optarg);
                 if (errno == ERANGE || flags.interval > INT_MAX)
                     exit_on_error(EXIT_FAILURE, false, "option value too big: %s", optarg);
-                if (flags.interval == 0)
-                    exit_on_error(EXIT_FAILURE, false, "-f and -i incompatible options");
                 break;
 
             case 'c':
@@ -157,8 +166,34 @@ static void parse_args(int ac, char **av)
 
 }
 
+struct sockaddr *resolve_dns(char *target)
+{
+    int ret_code;
+    struct sockaddr *ret_addr;
+    struct addrinfo *result;
+    struct addrinfo hints = {
+        .ai_family = AF_INET,       // Force ipv4 address
+        .ai_socktype = SOCK_RAW,    // Raw socket required to manually build icmp headers
+        .ai_protocol = IPPROTO_ICMP // Use icmp protocol
+    };
+
+    ret_code = getaddrinfo(target, NULL, &hints, &result);
+    if (ret_code != 0)
+        exit_on_error(EXIT_FAILURE, false, "getaddrinfo: %s\n",  gai_strerror(ret_code));
+
+    ret_addr = malloc(result->ai_addrlen);
+    if (!ret_addr)
+        exit_on_error(EXIT_FAILURE, false, "malloc failed");
+
+    memcpy(ret_addr, result->ai_addr, result->ai_addrlen);
+    freeaddrinfo(result);
+
+    return ret_addr;
+}
+
 int main(int ac, char **av)
 {
     parse_args(ac, av);
+    struct sockaddr *addr_to_send = resolve_dns(flags.target);
     return 0;
 }
