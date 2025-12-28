@@ -1,6 +1,6 @@
 NAME	= ft_ping
 CC		= gcc
-CFLAGS	= -Wall -Wextra -Werror
+CFLAGS	= -Wall -Wextra -Werror -D_DEFAULT_SOURCE
 SRC		= ft_ping.c
 OBJ		= $(SRC:.c=.o)
 

@@ -1,3 +1,8 @@
+#ifndef _DEFAULT_SOURCE
+/* Expose legacy BSD-like network structs (struct icmp etc.) to headers when not
+    already defined by compiler flags (e.g. -D_DEFAULT_SOURCE in Makefile). */
+#define _DEFAULT_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -12,6 +17,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/time.h>
+#include <netinet/ip_icmp.h>
 
 #define SHORT_TTL_IF 1000
 #define PING_MIN_USER_INTERVAL (0.2)
@@ -19,7 +25,7 @@
 #define EXIT_FAILURE_USAGE 64
 
 #define exit_on_error(code, usage_msg, fmt, ...) do { \
-    fprintf(stderr, "ping: "); \
+    fprintf(stderr, "ft_ping: "); \
     fprintf(stderr, fmt, ##__VA_ARGS__); \
     fprintf(stderr, "\n"); \
     if (usage_msg) \
@@ -32,7 +38,6 @@ typedef struct s_ping {
     bool        help;
     bool        flood;
     bool        numeric_only;
-    bool        is_root;
     int         time_to_live;
     double      interval;
     size_t      count;
@@ -44,6 +49,9 @@ typedef struct s_ping_context {
     socklen_t           addr_len;
     char                ipv4[INET_ADDRSTRLEN];
     int                 sockfd;
+    char                *icmp_buffer;
+    size_t              payload_len;
+    uint16_t            sequence;
 } t_ping_context;
 
 t_ping_flg flags = {
@@ -51,7 +59,6 @@ t_ping_flg flags = {
     .help = false,
     .flood = false,
     .numeric_only = false,
-    .is_root = false,
     .count = 0,
     .time_to_live = 0,
     .interval = 1,
@@ -97,8 +104,6 @@ static void parse_args(int ac, char **av)
     int opt;
 
     opterr = 0;
-    if (getuid () == 0)
-        flags.is_root = true;
     while (true)
     {
         char *endptr;
@@ -141,7 +146,7 @@ static void parse_args(int ac, char **av)
                 flags.interval = strtod(optarg, &endptr);
                 if (*endptr)
                     exit_on_error(EXIT_FAILURE_USAGE, true, "invalid value (`%s' near `%s')", optarg, endptr);
-                if (flags.interval < PING_MIN_USER_INTERVAL && !flags.is_root)
+                if (flags.interval < PING_MIN_USER_INTERVAL)
                     exit_on_error(EXIT_FAILURE, false, "option value too small: %s", optarg);
                 if (errno == ERANGE || flags.interval > INT_MAX)
                     exit_on_error(EXIT_FAILURE, false, "option value too big: %s", optarg);
@@ -200,23 +205,66 @@ void    resolve_dns(char *target)
     inet_ntop(AF_INET, &(ctx.addr.sin_addr), ctx.ipv4, INET_ADDRSTRLEN);
 }
 
-int main(int ac, char **av)
+void setup_context(void)
 {
-    parse_args(ac, av);
-    resolve_dns(flags.target);
-    
     // Socket creation
     ctx.sockfd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
-    if (ctx.sockfd == -1)
-        exit_on_error(EXIT_FAILURE, false, "Error: cannot create the socket.");
+    if (ctx.sockfd < 0) {
+        if (errno == EACCES || errno == EPERM)
+            exit_on_error(EXIT_FAILURE_USAGE, false, "Raw socket need root privilege.");
+        else
+            exit_on_error(EXIT_FAILURE, false, "Cannot create the socket.");
+    }
+    // Socket option (ttl & timeout)
     if (flags.time_to_live > 0)
         setsockopt(ctx.sockfd, IPPROTO_IP, IP_TTL, &flags.time_to_live, sizeof(flags.time_to_live));
     struct timeval timeout = {.tv_sec = 1, .tv_usec = 0};
     setsockopt(ctx.sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    // ICMP data
+    ctx.payload_len = 56;
+    ctx.icmp_buffer = malloc(sizeof(char) * (ctx.payload_len + ICMP_MINLEN));
+    if (!ctx.icmp_buffer)
+        exit_on_error(EXIT_FAILURE, false, "No space left on device");
+}
+
+void fill_icmp_buffer(void)
+{
+    // fill payload data (only timestamp used actually)
+    char *data_start = ctx.icmp_buffer + sizeof(struct icmp);
+    gettimeofday((struct timeval *)data_start, NULL);
+    int start_fill = sizeof(struct timeval);
+
+    for (size_t i = start_fill; i < ctx.payload_len; i++)
+        data_start[i] = i + '0';
+    
+    // fill icmp data
+    struct icmp *imsg = (struct icmp *)ctx.icmp_buffer;
+    imsg->icmp_type = ICMP_ECHO;
+    imsg->icmp_id = htons(getpid());
+    imsg->icmp_seq = htons(ctx.sequence);
+    // imsg->icmp_code = 0;                    // Always 0 for echo not Needed here
+    // imsg->icmp_cksum = 0;                   // Calculated below not Needed here
+
+    // imsg->icmp_cksum = checksum(ctx.icmp_buffer, ctx.payload_len + ICMP_MINLEN);
+}
 
 
+int main(int ac, char **av)
+{
+    parse_args(ac, av);
+    resolve_dns(flags.target);
+    setup_context();
 
-    printf("Target: %s\n", flags.target);
-    printf("Resolved IP: %s\n", ctx.ipv4);
+    printf("PING %s (%s): %zu data bytes", flags.target, ctx.ipv4, ctx.payload_len);
+
+    while(true) {
+        memset(ctx.icmp_buffer, 0, 64);
+        fill_icmp_buffer();
+
+    }
+
+
+    // printf("Target: %s\n", flags.target);
+    // printf("Resolved IP: %s\n", ctx.ipv4);
     return 0;
 }
