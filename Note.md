@@ -18,16 +18,28 @@
     [x] *-ttl* flag set time to live, mandatory pour traceroute                 Arg
     [x] *-i* flag interval, change le temps entre deux ping                     Arg
     [x] *-f* flag flood, spam de ping sans attendre                             No arg
-    [x] *-n* flag Numeric only, affiche que les adresses IP sans reverse DNS    No arg
+    [ ] *-W* flag Timeout, Customize le timeout de recvfrom                     No arg
 
 
-[ ] Main function and logic
+[x] Main function and logic
     [x] DNS (getaddrinfo) : Transformer "google.com" en IP
     [x] Raw Sockets : Créer le socket, gérer les permissions root  
-    [ ] ICMP Protocol : Construire les paquets à la main (Header, Data, Sequence, ID)  
-    [ ] Checksum : L'algorithme de vérification (bit à bit)
-    [ ] Signal Handler : Gérer le Ctrl+C proprement pour afficher les stats à la fin 
-    [ ] Timing : Calculer le RTT (Round Trip Time) avec précision
+    [x] ICMP Protocol : Construire les paquets à la main (Header, Data, Sequence, ID)  
+        [x] Envoie
+        [x] Reception
+    [x] Checksum : L'algorithme de vérification (bit à bit)
+    [x] Signal Handler : Gérer le Ctrl+C proprement pour afficher les stats à la fin 
+    [x] Timing : Calculer le RTT (Round Trip Time) avec précision
+
+
+[ ] Bonus
+    [x] *-c* flag count qui stop apres N ping
+    [x] *-i* flag interval, change le temps entre deux ping
+    [x] *-f* flag flood, spam de ping sans attendre
+    [ ] *-W* flag Timeout, Customize le timeout de recvfrom                     No arg
+    [ ] *-ttl* flag set time to live, mandatory pour traceroute                 Arg
+    [ ] Adapter *-v* pour chaque flags bonus
+    [ ] Gerer de nouveau icmpreply types pour les flags en *-W* et -ttl*
 
 
 https://ekman.cx/articles/icmp_sockets/

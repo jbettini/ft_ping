@@ -18,6 +18,8 @@
 #include <arpa/inet.h>
 #include <sys/time.h>
 #include <netinet/ip_icmp.h>
+#include <float.h>
+#include <signal.h> 
 
 #define SHORT_TTL_IF 1000
 #define PING_MIN_USER_INTERVAL (0.2)
@@ -51,8 +53,18 @@ typedef struct s_ping_context {
     int                 sockfd;
     char                *icmp_buffer;
     size_t              payload_len;
+    size_t              icmp_buffer_len;
     uint16_t            sequence;
+
 } t_ping_context;
+
+typedef struct s_ping_stats {
+    double      rtt_min;
+    double      rtt_avg;
+    double      rtt_max;
+    double      rtt_sum;
+    size_t      received;
+} t_ping_stats;
 
 t_ping_flg flags = {
     .verbose = false,
@@ -65,7 +77,16 @@ t_ping_flg flags = {
     .target = NULL
 };
 
+t_ping_stats stats = {
+    .rtt_min = DBL_MAX,
+    .rtt_avg = 0.0,
+    .rtt_max = 0.0,
+    .rtt_sum = 0.0,
+    .received = 0
+};
+
 t_ping_context ctx = {0};
+
 
 static struct option long_options[] = {
     {"verbose",         no_argument,        0, 'v'},
@@ -196,7 +217,12 @@ void    resolve_dns(char *target)
 
     ret_code = getaddrinfo(target, NULL, &hints, &result);
     if (ret_code != 0)
-        exit_on_error(EXIT_FAILURE, false, "getaddrinfo: %s\n",  gai_strerror(ret_code));
+    {
+        if (ret_code == EAI_NONAME)
+             exit_on_error(EXIT_FAILURE, false, "unknown host");
+        else
+            exit_on_error(EXIT_FAILURE, false, "getaddrinfo: %s\n",  gai_strerror(ret_code));
+    }
 
     ctx.addr_len = result->ai_addrlen;
 
@@ -222,10 +248,27 @@ void setup_context(void)
     setsockopt(ctx.sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
     // ICMP data
     ctx.payload_len = 56;
-    ctx.icmp_buffer = malloc(sizeof(char) * (ctx.payload_len + ICMP_MINLEN));
+    ctx.icmp_buffer_len = ctx.payload_len + ICMP_MINLEN;
+    ctx.icmp_buffer = malloc(sizeof(char) * ctx.icmp_buffer_len);
     if (!ctx.icmp_buffer)
         exit_on_error(EXIT_FAILURE, false, "No space left on device");
 }
+
+uint16_t checksum(void *addr, size_t len) {
+    uint16_t *word = addr;
+    uint32_t result = 0;
+
+    for (long unsigned int i = 0; i < len / sizeof(uint16_t); i++)
+        result += *(word + i);
+    if (len % 2 == 1)
+        result += *((uint8_t *)addr + len - 1);
+    
+    result = (result >> 16) + (result & 0xffff);
+    // for specific case
+    result = (result >> 16) + (result & 0xffff);
+    return ~result;
+}
+
 
 void fill_icmp_buffer(void)
 {
@@ -242,29 +285,138 @@ void fill_icmp_buffer(void)
     imsg->icmp_type = ICMP_ECHO;
     imsg->icmp_id = htons(getpid());
     imsg->icmp_seq = htons(ctx.sequence);
-    // imsg->icmp_code = 0;                    // Always 0 for echo not Needed here
-    // imsg->icmp_cksum = 0;                   // Calculated below not Needed here
-
-    // imsg->icmp_cksum = checksum(ctx.icmp_buffer, ctx.payload_len + ICMP_MINLEN);
+    // imsg->icmp_code = 0;                    // Already 0 ( Normally needed for echo paaeut)
+    imsg->icmp_cksum = checksum(ctx.icmp_buffer, ctx.icmp_buffer_len);
 }
 
+void finish_ping(void)
+{
+    printf("--- %s ping statistics ---\n", flags.target);
+    
+    int percent_loss = 0;
+    if (ctx.sequence > 0)
+        percent_loss = ((ctx.sequence - stats.received) * 100) / ctx.sequence;
+
+    printf("%zu packets transmitted, %zu packets received, %d%% packet loss\n", 
+        (size_t)ctx.sequence, 
+        stats.received, 
+        percent_loss);
+
+    if (stats.received > 0)
+    {
+        stats.rtt_avg = stats.rtt_sum / stats.received;
+        
+        printf("round-trip min/avg/max = %.3f/%.3f/%.3f ms\n", 
+            stats.rtt_min, 
+            stats.rtt_avg, 
+            stats.rtt_max);
+    }
+
+    free(ctx.icmp_buffer);
+}
+
+void singalHandler(int sig)
+{
+    (void)sig;
+    finish_ping();
+    exit(0);
+}
 
 int main(int ac, char **av)
 {
+    uint8_t rec_buf[IP_MAXPACKET];
+
+    signal(SIGINT, singalHandler); 
     parse_args(ac, av);
     resolve_dns(flags.target);
     setup_context();
-
-    printf("PING %s (%s): %zu data bytes", flags.target, ctx.ipv4, ctx.payload_len);
+    printf("PING %s (%s): %zu data bytes\n", flags.target, ctx.ipv4, ctx.payload_len);
 
     while(true) {
-        memset(ctx.icmp_buffer, 0, 64);
+        if (flags.count > 0 && ctx.sequence >= flags.count)
+            break;
+        memset(ctx.icmp_buffer, 0, ctx.icmp_buffer_len);        
         fill_icmp_buffer();
+        sendto(ctx.sockfd, ctx.icmp_buffer, ctx.icmp_buffer_len, 0,
+            (const struct sockaddr *)&ctx.addr, ctx.addr_len);
+        ctx.sequence++;
+
+        memset(rec_buf, 0, IP_MAXPACKET);
+        struct sockaddr_storage addr;
+        socklen_t addr_len = sizeof(addr);
+
+        ssize_t bytes_ret = recvfrom(ctx.sockfd, rec_buf, IP_MAXPACKET, 0,
+            (struct sockaddr *)&addr, &addr_len);
+
+        if (bytes_ret < 0)
+            continue ;
+        if ((size_t)bytes_ret < sizeof(struct ip))
+            continue ;
+
+        struct ip *ip = (struct ip *)rec_buf;
+        int ip_len = ip->ip_hl * 4;
+
+        if ((size_t)bytes_ret < ip_len + sizeof(struct icmp))
+            continue ;
+
+        struct icmp *icmp = (struct icmp *)(rec_buf + ip_len);
+
+  
+
+        // Need switch case to handle 
+        if (icmp->icmp_type == ICMP_ECHOREPLY) {
+            if (icmp->icmp_id != htons(getpid()))
+                continue;
+        }
+        else
+            continue;
+
+
+        /* TODO
+         *  
+         * 
+         *  Implement all flags :
+         *  [ ] *-v* flag verbose
+         *  [x] *-c* flag count qui stop apres N ping                               
+         *  [x] *-i* flag interval, change le temps entre deux ping                 
+         *  [x] *-f* flag flood, spam de ping sans attendre                         
+         *  [ ] *-W* Time out on recvftom
+         *      [ ] Parsing
+         *      [ ] init + handling on icmp reply flag
+         *  [ ] *-ttl* flag set time to live, mandatory pour traceroute             
+         *      [ ] handle multiple ICMP reply type
+         * 
+         */
+
+        // int headers_size = ip_len + sizeof(struct icmp);
+
+        // // On vérifie qu'il reste assez de place pour contenir un struct timeval
+        // if (bytes_ret < headers_size + sizeof(struct timeval)) {
+        //     // Le paquet est valide (bon checksum/type) mais il ne contient pas de timestamp !
+        //     // On ne peut pas calculer le RTT.
+        //     return; // Ou continue
+        // }
+
+        struct timeval *start_time = (struct timeval *)((char *)icmp + sizeof(struct icmp));
+        struct timeval end_time;
+        gettimeofday(&end_time, NULL);
+
+        double rtt_in_us = (double)(end_time.tv_sec - start_time->tv_sec) * 1e6 +
+                          (double)(end_time.tv_usec - start_time->tv_usec);
+        
+        double time_to_sleep = (flags.interval * 1e6) - rtt_in_us;
+
+        if (time_to_sleep > 0 && !flags.flood)
+            usleep((useconds_t)time_to_sleep);
+        
+
+        // 64 bytes from 172.217.171.238: icmp_seq=2 ttl=116 time=10.692 ms
+        printf("%zu bytes from %s: icmp_seq=%d ttl= time=%.3f ms\n", (bytes_ret - ip_len), ctx.ipv4,  ntohs(icmp->icmp_seq), rtt_in_us);
 
     }
-
+    finish_ping();
+    return 0;
+}
 
     // printf("Target: %s\n", flags.target);
     // printf("Resolved IP: %s\n", ctx.ipv4);
-    return 0;
-}
