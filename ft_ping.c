@@ -9,7 +9,6 @@
 #include <errno.h>
 #include <getopt.h>
 #include <limits.h>
-#include <sys/types.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <netdb.h>
@@ -20,11 +19,16 @@
 #include <netinet/ip_icmp.h>
 #include <float.h>
 #include <signal.h> 
+#include <sys/types.h>
 
 #define SHORT_TTL_IF 1000
 #define PING_MIN_USER_INTERVAL (0.2)
 #define EXIT_FAILURE 1
 #define EXIT_FAILURE_USAGE 64
+#define MAXIPLEN 60
+#define MAXICMPLEN 76
+#define PING_MAX_DATALEN (65535 - MAXIPLEN - MAXICMPLEN)
+#define DEFAULT_PAYLOAD_LEN 56
 
 #define exit_on_error(code, usage_msg, fmt, ...) do { \
     fprintf(stderr, "ft_ping: "); \
@@ -39,22 +43,23 @@ typedef struct s_ping {
     bool        verbose;
     bool        help;
     bool        flood;
-    bool        numeric_only;
     int         time_to_live;
     double      interval;
     size_t      count;
+    size_t      size;
     char        *target;
 } t_ping_flg;
 
 typedef struct s_ping_context {
-    struct sockaddr_in  addr;
-    socklen_t           addr_len;
     char                ipv4[INET_ADDRSTRLEN];
-    int                 sockfd;
     char                *icmp_buffer;
-    size_t              payload_len;
+    bool                size_permit_rtt;
+    bool                running;
+    int                 sockfd;
     size_t              icmp_buffer_len;
     uint16_t            sequence;
+    socklen_t           addr_len;
+    struct sockaddr_in  addr;
 
 } t_ping_context;
 
@@ -66,12 +71,34 @@ typedef struct s_ping_stats {
     size_t      received;
 } t_ping_stats;
 
+struct icmp_code_descr
+{
+  int type;
+  int code;
+  char *diag;
+} icmp_code_descr[] =
+  {
+    {ICMP_DEST_UNREACH, ICMP_NET_UNREACH, "Destination Net Unreachable"},
+    {ICMP_DEST_UNREACH, ICMP_HOST_UNREACH, "Destination Host Unreachable"},
+    {ICMP_DEST_UNREACH, ICMP_PROT_UNREACH, "Destination Protocol Unreachable"},
+    {ICMP_DEST_UNREACH, ICMP_PORT_UNREACH, "Destination Port Unreachable"},
+    {ICMP_DEST_UNREACH, ICMP_FRAG_NEEDED, "Fragmentation needed and DF set"},
+    {ICMP_DEST_UNREACH, ICMP_SR_FAILED, "Source Route Failed"},
+    {ICMP_DEST_UNREACH, ICMP_NET_UNKNOWN, "Network Unknown"},
+    {ICMP_DEST_UNREACH, ICMP_HOST_UNKNOWN, "Host Unknown"},
+    {ICMP_DEST_UNREACH, ICMP_HOST_ISOLATED, "Host Isolated"},
+    {ICMP_DEST_UNREACH, ICMP_NET_UNR_TOS, "Destination Network Unreachable At This TOS"},
+    {ICMP_DEST_UNREACH, ICMP_HOST_UNR_TOS, "Destination Host Unreachable At This TOS"},
+    {ICMP_TIME_EXCEEDED, ICMP_EXC_TTL, "Time to live exceeded"},
+    {ICMP_TIME_EXCEEDED, ICMP_EXC_FRAGTIME, "Frag reassembly time exceeded"}
+  };
+
 t_ping_flg flags = {
     .verbose = false,
     .help = false,
     .flood = false,
-    .numeric_only = false,
     .count = 0,
+    .size = DEFAULT_PAYLOAD_LEN,
     .time_to_live = 0,
     .interval = 1,
     .target = NULL
@@ -120,6 +147,28 @@ static void print_help(void)
     printf("for any corresponding short options.\n");
 }
 
+static inline void check_invalid_value(char *optarg, char *endptr)
+{
+    if (*endptr)
+        exit_on_error(EXIT_FAILURE_USAGE, true, "invalid value (`%s' near `%s')", optarg, endptr);
+}
+
+static inline void check_value_too_big(bool condition, char *optarg)
+{
+    if (condition)
+        exit_on_error(EXIT_FAILURE, false, "option value too big: %s", optarg);
+}
+
+static inline struct ip *get_ip_from_buffer(uint8_t *rec_buf)
+{
+    return (struct ip *)rec_buf;
+}
+
+static inline int get_ip_len(struct ip *ip)
+{
+    return ip->ip_hl * 4;
+}
+
 static void parse_args(int ac, char **av)
 {
     int opt;
@@ -128,7 +177,7 @@ static void parse_args(int ac, char **av)
     while (true)
     {
         char *endptr;
-        opt = getopt_long(ac, av, "v?fnc:i:", long_options, NULL);
+        opt = getopt_long(ac, av, "v?fs:c:i:", long_options, NULL);
         if (opt == -1)
             break;
         switch (opt)
@@ -142,10 +191,6 @@ static void parse_args(int ac, char **av)
                     exit_on_error(EXIT_FAILURE, false, "-f and -i incompatible options");
                 flags.flood = true;
                 flags.interval = 0;
-                break;
-
-            case 'n':
-                flags.numeric_only = true;
                 break;
 
             case '?':
@@ -165,35 +210,38 @@ static void parse_args(int ac, char **av)
                     exit_on_error(EXIT_FAILURE, false, "-f and -i incompatible options");
                 errno = 0;
                 flags.interval = strtod(optarg, &endptr);
-                if (*endptr)
-                    exit_on_error(EXIT_FAILURE_USAGE, true, "invalid value (`%s' near `%s')", optarg, endptr);
+                check_invalid_value(optarg, endptr);
+                
                 if (flags.interval < PING_MIN_USER_INTERVAL)
                     exit_on_error(EXIT_FAILURE, false, "option value too small: %s", optarg);
-                if (errno == ERANGE || flags.interval > INT_MAX)
-                    exit_on_error(EXIT_FAILURE, false, "option value too big: %s", optarg);
+                check_value_too_big(errno == ERANGE || flags.interval > INT_MAX, optarg);
                 break;
 
             case 'c':
                 long count = strtol(optarg, &endptr, 10);
                 if (count < 0)
                     count = 0;
-                if (*endptr)
-                    exit_on_error(EXIT_FAILURE_USAGE, true, "invalid value (`%s' near `%s')", optarg, endptr);
+                check_invalid_value(optarg, endptr);
                 flags.count = (errno == ERANGE ? -1 : count);
             break;
 
             case SHORT_TTL_IF:
                 errno = 0;
                 unsigned long ttl = strtoul(optarg, &endptr, 10);
-                if (*endptr)
-                    exit_on_error(EXIT_FAILURE_USAGE, true, "invalid value (`%s' near `%s')", optarg, endptr);
-                if (errno == ERANGE || ttl > 255)
-                    exit_on_error(EXIT_FAILURE, false, "option value too big: %s", optarg);
+                check_invalid_value(optarg, endptr);
+                check_value_too_big(errno == ERANGE || ttl > 255, optarg);
                 flags.time_to_live = (int)ttl;
             break;
 
+            case 's':
+                errno = 0;
+                flags.size = strtoul(optarg, &endptr, 0);
+                check_invalid_value(optarg, endptr);
+                check_value_too_big(errno == ERANGE || (PING_MAX_DATALEN && flags.size > PING_MAX_DATALEN), optarg);
+                break;
+
             default:
-                exit(64);
+                exit(EXIT_FAILURE_USAGE);
                 break;
         }
     }
@@ -204,7 +252,7 @@ static void parse_args(int ac, char **av)
 
 }
 
-void    resolve_dns(char *target)
+static void resolve_dns(char *target)
 {
     int ret_code;
 
@@ -231,7 +279,7 @@ void    resolve_dns(char *target)
     inet_ntop(AF_INET, &(ctx.addr.sin_addr), ctx.ipv4, INET_ADDRSTRLEN);
 }
 
-void setup_context(void)
+static void setup_context(void)
 {
     // Socket creation
     ctx.sockfd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
@@ -247,14 +295,18 @@ void setup_context(void)
     struct timeval timeout = {.tv_sec = 1, .tv_usec = 0};
     setsockopt(ctx.sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
     // ICMP data
-    ctx.payload_len = 56;
-    ctx.icmp_buffer_len = ctx.payload_len + ICMP_MINLEN;
+    ctx.size_permit_rtt = (flags.size >= sizeof(struct timeval));
+    ctx.icmp_buffer_len = flags.size + ICMP_MINLEN;
+
     ctx.icmp_buffer = malloc(sizeof(char) * ctx.icmp_buffer_len);
     if (!ctx.icmp_buffer)
         exit_on_error(EXIT_FAILURE, false, "No space left on device");
+
+    ctx.running = true;
+
 }
 
-uint16_t checksum(void *addr, size_t len) {
+static uint16_t checksum(void *addr, size_t len) {
     uint16_t *word = addr;
     uint32_t result = 0;
 
@@ -270,14 +322,16 @@ uint16_t checksum(void *addr, size_t len) {
 }
 
 
-void fill_icmp_buffer(void)
+static void fill_icmp_buffer(void)
 {
+    size_t start_fill = 0;
     // fill payload data (only timestamp used actually)
     char *data_start = ctx.icmp_buffer + sizeof(struct icmp);
-    gettimeofday((struct timeval *)data_start, NULL);
-    int start_fill = sizeof(struct timeval);
-
-    for (size_t i = start_fill; i < ctx.payload_len; i++)
+    if (ctx.size_permit_rtt) {
+        gettimeofday((struct timeval *)data_start, NULL);
+        start_fill = sizeof(struct timeval);
+    }
+    for (size_t i = start_fill; i < flags.size; i++)
         data_start[i] = i + '0';
     
     // fill icmp data
@@ -287,6 +341,21 @@ void fill_icmp_buffer(void)
     imsg->icmp_seq = htons(ctx.sequence);
     // imsg->icmp_code = 0;                    // Already 0 ( Normally needed for echo paaeut)
     imsg->icmp_cksum = checksum(ctx.icmp_buffer, ctx.icmp_buffer_len);
+}
+
+static struct icmp *check_recv_ret(ssize_t bytes_ret, uint8_t *rec_buf)
+{
+    if (bytes_ret < 0)
+        return NULL;
+    if ((size_t)bytes_ret < sizeof(struct ip))
+        return NULL;
+
+    struct ip *ip = get_ip_from_buffer(rec_buf);
+    int ip_len = get_ip_len(ip);
+    if (bytes_ret < ip_len + ICMP_MINLEN)
+        return NULL;
+
+    return (struct icmp *)(rec_buf + ip_len);
 }
 
 void finish_ping(void)
@@ -302,24 +371,71 @@ void finish_ping(void)
         stats.received, 
         percent_loss);
 
-    if (stats.received > 0)
+    if (stats.received > 0 && ctx.size_permit_rtt)
     {
         stats.rtt_avg = stats.rtt_sum / stats.received;
         
         printf("round-trip min/avg/max = %.3f/%.3f/%.3f ms\n", 
-            stats.rtt_min, 
-            stats.rtt_avg, 
-            stats.rtt_max);
+            stats.rtt_min / 1000.0, 
+            stats.rtt_avg / 1000.0, 
+            stats.rtt_max / 1000.0);
     }
-
+    if (!ctx.icmp_buffer || ctx.sockfd == -1)
+        exit_on_error(EXIT_FAILURE, false, "WTF is happening bro ??");
+    close(ctx.sockfd);
+    ctx.sockfd = -1;
     free(ctx.icmp_buffer);
+    ctx.icmp_buffer = NULL;
 }
 
 void singalHandler(int sig)
 {
     (void)sig;
-    finish_ping();
-    exit(0);
+    ctx.running = false;
+}
+
+
+
+// Separate Prompt and wait
+
+static inline prompt()
+{
+
+}
+
+static void wait_and_prompt(ssize_t bytes_ret, uint8_t *rec_buf, struct icmp *icmp)
+{
+    double rtt_in_us = 0;
+    
+    struct ip *ip = get_ip_from_buffer(rec_buf);
+    int ip_len = get_ip_len(ip);
+    size_t headers_size = ip_len + sizeof(struct icmp);
+    
+    bool rtt_is_calculable = ((size_t)bytes_ret >= headers_size + sizeof(struct timeval) && ctx.size_permit_rtt);
+
+    if (rtt_is_calculable) {
+        struct timeval *start_time = (struct timeval *)((char *)icmp + sizeof(struct icmp));
+        struct timeval end_time;
+        gettimeofday(&end_time, NULL);
+    
+        rtt_in_us = (double)(end_time.tv_sec - start_time->tv_sec) * 1e6 +
+                    (double)(end_time.tv_usec - start_time->tv_usec);
+        stats.rtt_sum += rtt_in_us;
+        if (rtt_in_us < stats.rtt_min)
+            stats.rtt_min = rtt_in_us;
+        if (rtt_in_us > stats.rtt_max)
+            stats.rtt_max = rtt_in_us;
+    }
+
+    double time_to_sleep = (flags.interval * 1e6) - rtt_in_us;
+    if (time_to_sleep > 0 && !flags.flood)
+        usleep((useconds_t)time_to_sleep);
+
+    printf("%zu bytes from %s: icmp_seq=%d ttl=%d", (bytes_ret - ip_len), ctx.ipv4, ntohs(icmp->icmp_seq), ip->ip_ttl);
+
+    if (rtt_is_calculable)
+        printf(" time=%.3f ms", rtt_in_us / 1000.0);
+    printf("\n");
 }
 
 int main(int ac, char **av)
@@ -330,93 +446,60 @@ int main(int ac, char **av)
     parse_args(ac, av);
     resolve_dns(flags.target);
     setup_context();
-    printf("PING %s (%s): %zu data bytes\n", flags.target, ctx.ipv4, ctx.payload_len);
+    printf("PING %s (%s): %zu data bytes\n", flags.target, ctx.ipv4, flags.size);
 
-    while(true) {
+    while(ctx.running) {
         if (flags.count > 0 && ctx.sequence >= flags.count)
             break;
         memset(ctx.icmp_buffer, 0, ctx.icmp_buffer_len);        
         fill_icmp_buffer();
         sendto(ctx.sockfd, ctx.icmp_buffer, ctx.icmp_buffer_len, 0,
-            (const struct sockaddr *)&ctx.addr, ctx.addr_len);
+                    (const struct sockaddr *)&ctx.addr, ctx.addr_len);
         ctx.sequence++;
-
-        memset(rec_buf, 0, IP_MAXPACKET);
-        struct sockaddr_storage addr;
-        socklen_t addr_len = sizeof(addr);
-
-        ssize_t bytes_ret = recvfrom(ctx.sockfd, rec_buf, IP_MAXPACKET, 0,
-            (struct sockaddr *)&addr, &addr_len);
-
-        if (bytes_ret < 0)
-            continue ;
-        if ((size_t)bytes_ret < sizeof(struct ip))
-            continue ;
-
-        struct ip *ip = (struct ip *)rec_buf;
-        int ip_len = ip->ip_hl * 4;
-
-        if ((size_t)bytes_ret < ip_len + sizeof(struct icmp))
-            continue ;
-
-        struct icmp *icmp = (struct icmp *)(rec_buf + ip_len);
-
-  
-
-        // Need switch case to handle 
-        if (icmp->icmp_type == ICMP_ECHOREPLY) {
-            if (icmp->icmp_id != htons(getpid()))
-                continue;
+    
+        struct icmp *icmp = NULL;
+        ssize_t bytes_ret = 0;
+        while (true) {
+            struct sockaddr_storage addr;
+            socklen_t addr_len = sizeof(addr);
+            memset(rec_buf, 0, IP_MAXPACKET);
+            bytes_ret = recvfrom(ctx.sockfd, rec_buf, IP_MAXPACKET, 0,
+                                    (struct sockaddr *)&addr, &addr_len);
+    
+            icmp = check_recv_ret(bytes_ret, rec_buf);
+            if (!icmp)
+                continue ;
+            else if (icmp->icmp_type == ICMP_ECHOREPLY) {
+                if (icmp->icmp_id != htons(getpid()))
+                    continue;
+                wait_and_prompt(bytes_ret, rec_buf, icmp);
+                stats.received++;
+                break;
+            }
+            else {
+                switch (icmp->icmp_type )
+                {
+                    case ICMP_DEST_UNREACH:
+                        printf("imcp packet :%zu\n", sizeof(icmp));
+                        break;
+                    
+                    default:
+                        break;
+                }
+            }
         }
-        else
-            continue;
-
-
-        /* TODO
-         *  
-         * 
-         *  Implement all flags :
-         *  [ ] *-v* flag verbose
-         *  [x] *-c* flag count qui stop apres N ping                               
-         *  [x] *-i* flag interval, change le temps entre deux ping                 
-         *  [x] *-f* flag flood, spam de ping sans attendre                         
-         *  [ ] *-W* Time out on recvftom
-         *      [ ] Parsing
-         *      [ ] init + handling on icmp reply flag
-         *  [ ] *-ttl* flag set time to live, mandatory pour traceroute             
-         *      [ ] handle multiple ICMP reply type
-         * 
-         */
-
-        // int headers_size = ip_len + sizeof(struct icmp);
-
-        // // On vérifie qu'il reste assez de place pour contenir un struct timeval
-        // if (bytes_ret < headers_size + sizeof(struct timeval)) {
-        //     // Le paquet est valide (bon checksum/type) mais il ne contient pas de timestamp !
-        //     // On ne peut pas calculer le RTT.
-        //     return; // Ou continue
-        // }
-
-        struct timeval *start_time = (struct timeval *)((char *)icmp + sizeof(struct icmp));
-        struct timeval end_time;
-        gettimeofday(&end_time, NULL);
-
-        double rtt_in_us = (double)(end_time.tv_sec - start_time->tv_sec) * 1e6 +
-                          (double)(end_time.tv_usec - start_time->tv_usec);
-        
-        double time_to_sleep = (flags.interval * 1e6) - rtt_in_us;
-
-        if (time_to_sleep > 0 && !flags.flood)
-            usleep((useconds_t)time_to_sleep);
-        
-
-        // 64 bytes from 172.217.171.238: icmp_seq=2 ttl=116 time=10.692 ms
-        printf("%zu bytes from %s: icmp_seq=%d ttl= time=%.3f ms\n", (bytes_ret - ip_len), ctx.ipv4,  ntohs(icmp->icmp_seq), rtt_in_us);
-
     }
     finish_ping();
-    return 0;
+    return EXIT_SUCCESS;
 }
 
-    // printf("Target: %s\n", flags.target);
-    // printf("Resolved IP: %s\n", ctx.ipv4);
+/* TODO
+ * 
+ *  Implement all flags :
+ *  [ ] handle multiple ICMP reply type
+ *      [ ] ECHO_UNREACHEABLE
+ *      [ ] ECHO TIME EXCEED but after flag --ttl
+ *  [ ] *-ttl* flag set time to live, mandatory pour traceroute             
+ *  [ ] *-v* flag verbose
+ *      [ ] horrible
+ */
