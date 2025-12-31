@@ -3,3 +3,8 @@ services:
     build: .
     volumes: 
       - .:/root/src
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    # network_mode: none
+    

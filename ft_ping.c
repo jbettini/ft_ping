@@ -39,6 +39,13 @@
     exit(code); \
 } while(0)
 
+
+size_t err_nb = 0;
+#define debug_err() do { \
+    printf("%d\n", __LINE__); \
+    err_nb++; \
+} while(0)
+
 typedef struct s_ping {
     bool        verbose;
     bool        help;
@@ -90,8 +97,9 @@ struct icmp_code_descr
     {ICMP_DEST_UNREACH, ICMP_NET_UNR_TOS, "Destination Network Unreachable At This TOS"},
     {ICMP_DEST_UNREACH, ICMP_HOST_UNR_TOS, "Destination Host Unreachable At This TOS"},
     {ICMP_TIME_EXCEEDED, ICMP_EXC_TTL, "Time to live exceeded"},
-    {ICMP_TIME_EXCEEDED, ICMP_EXC_FRAGTIME, "Frag reassembly time exceeded"}
-  };
+    {ICMP_TIME_EXCEEDED, ICMP_EXC_FRAGTIME, "Frag reassembly time exceeded"},
+    {0, 0, NULL}
+};
 
 t_ping_flg flags = {
     .verbose = false,
@@ -167,6 +175,19 @@ static inline struct ip *get_ip_from_buffer(uint8_t *rec_buf)
 static inline int get_ip_len(struct ip *ip)
 {
     return ip->ip_hl * 4;
+}
+
+static inline struct ip *err_to_ori_ip(uint8_t *err_icmp)
+{
+    return (struct ip *)(err_icmp + ICMP_MINLEN);
+}
+
+static inline struct icmp *err_to_ori_icmp(uint8_t *err_icmp)
+{
+    struct ip *ori_ip = err_to_ori_ip(err_icmp);
+    int ip_len = get_ip_len(ori_ip);
+    
+    return (struct icmp *)((uint8_t *)ori_ip + ip_len);
 }
 
 static void parse_args(int ac, char **av)
@@ -269,7 +290,7 @@ static void resolve_dns(char *target)
         if (ret_code == EAI_NONAME)
              exit_on_error(EXIT_FAILURE, false, "unknown host");
         else
-            exit_on_error(EXIT_FAILURE, false, "getaddrinfo: %s\n",  gai_strerror(ret_code));
+            exit_on_error(EXIT_FAILURE, false, "getaddrinfo: %s",  gai_strerror(ret_code));
     }
 
     ctx.addr_len = result->ai_addrlen;
@@ -303,6 +324,7 @@ static void setup_context(void)
         exit_on_error(EXIT_FAILURE, false, "No space left on device");
 
     ctx.running = true;
+    ctx.sequence = 1;
 
 }
 
@@ -343,21 +365,6 @@ static void fill_icmp_buffer(void)
     imsg->icmp_cksum = checksum(ctx.icmp_buffer, ctx.icmp_buffer_len);
 }
 
-static struct icmp *check_recv_ret(ssize_t bytes_ret, uint8_t *rec_buf)
-{
-    if (bytes_ret < 0)
-        return NULL;
-    if ((size_t)bytes_ret < sizeof(struct ip))
-        return NULL;
-
-    struct ip *ip = get_ip_from_buffer(rec_buf);
-    int ip_len = get_ip_len(ip);
-    if (bytes_ret < ip_len + ICMP_MINLEN)
-        return NULL;
-
-    return (struct icmp *)(rec_buf + ip_len);
-}
-
 void finish_ping(void)
 {
     printf("--- %s ping statistics ---\n", flags.target);
@@ -396,12 +403,12 @@ void singalHandler(int sig)
 
 
 
-// Separate Prompt and wait
+// Separate Prompt and wait and update stats
 
-static inline prompt()
-{
+// static inline prompt()
+// {
 
-}
+// }
 
 static void wait_and_prompt(ssize_t bytes_ret, uint8_t *rec_buf, struct icmp *icmp)
 {
@@ -438,12 +445,101 @@ static void wait_and_prompt(ssize_t bytes_ret, uint8_t *rec_buf, struct icmp *ic
     printf("\n");
 }
 
-int main(int ac, char **av)
+static struct icmp *check_recv_ret(ssize_t bytes_ret, uint8_t *rec_buf)
 {
+    if ((size_t)bytes_ret < sizeof(struct ip))
+        return NULL;
+
+    struct ip *ip = get_ip_from_buffer(rec_buf);
+    int ip_len = get_ip_len(ip);
+    if (bytes_ret < ip_len + ICMP_MINLEN)
+        return NULL;
+
+    return (struct icmp *)(rec_buf + ip_len);
+}
+
+
+static void send_ping(void) 
+{
+    memset(ctx.icmp_buffer, 0, ctx.icmp_buffer_len);        
+    fill_icmp_buffer();
+
+    int send_ret = sendto(ctx.sockfd, ctx.icmp_buffer, ctx.icmp_buffer_len, 0,
+                    (struct sockaddr *)&ctx.addr, ctx.addr_len);
+    // (void)send_ret;
+    if (send_ret < 0) {
+        if (errno == ENETUNREACH)
+            exit_on_error(EXIT_FAILURE, false, "sending packet: Network is unreachable");
+        else
+            fprintf(stderr, "ft_ping: sendto: %s\n", strerror(errno));
+    }
+    ctx.sequence++;
+}
+
+static char *handle_imcp_error(struct icmp* icmp)
+{
+    for (int i = 0; icmp_code_descr[i].diag; i++) {
+        struct icmp_code_descr current = icmp_code_descr[i];
+        if (icmp->icmp_type == current.type && 
+            icmp->icmp_code == current.code)
+            return current.diag;
+    }
+    return "Unknow icmp error code/type.";
+}
+
+
+static void recv_pong(void)
+{
+    ssize_t bytes_ret = 0;
+    struct icmp *icmp = NULL;
     uint8_t rec_buf[IP_MAXPACKET];
 
-    signal(SIGINT, singalHandler); 
+    while (ctx.running) {
+        struct sockaddr_storage addr;
+        socklen_t addr_len = sizeof(addr);
+        memset(rec_buf, 0, IP_MAXPACKET);
+        bytes_ret = recvfrom(ctx.sockfd, rec_buf, IP_MAXPACKET, 0,
+                                (struct sockaddr *)&addr, &addr_len);
+        if (bytes_ret < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                break; 
+            if (errno == EINTR) 
+                break;
+            continue;
+        }
+        icmp = check_recv_ret(bytes_ret, rec_buf);
+        if (!icmp)
+            continue ;
+        switch (icmp->icmp_type )
+        {
+            case ICMP_ECHOREPLY:
+                if (icmp->icmp_id != htons(getpid()))
+                    continue;
+                // if (!flags.flood)
+                wait_and_prompt(bytes_ret, rec_buf, icmp);
+                stats.received++;
+                return;
+            case ICMP_DEST_UNREACH:
+                struct ip *ip = get_ip_from_buffer(rec_buf);
+                struct icmp *original_icmp = err_to_ori_icmp((uint8_t *)icmp);
+                if (original_icmp->icmp_id != htons(getpid()))
+                    continue;
+                fprintf(stderr, "From %s: icmp_seq=%u %s\n", 
+                       inet_ntoa(ip->ip_src), 
+                       ntohs(original_icmp->icmp_seq), 
+                       handle_imcp_error(icmp));
+                break;
+            
+            default:
+                break;
+        }
+    }
+}
+
+int main(int ac, char **av)
+{
     parse_args(ac, av);
+    signal(SIGINT, singalHandler); 
     resolve_dns(flags.target);
     setup_context();
     printf("PING %s (%s): %zu data bytes\n", flags.target, ctx.ipv4, flags.size);
@@ -451,43 +547,9 @@ int main(int ac, char **av)
     while(ctx.running) {
         if (flags.count > 0 && ctx.sequence >= flags.count)
             break;
-        memset(ctx.icmp_buffer, 0, ctx.icmp_buffer_len);        
-        fill_icmp_buffer();
-        sendto(ctx.sockfd, ctx.icmp_buffer, ctx.icmp_buffer_len, 0,
-                    (const struct sockaddr *)&ctx.addr, ctx.addr_len);
-        ctx.sequence++;
-    
-        struct icmp *icmp = NULL;
-        ssize_t bytes_ret = 0;
-        while (true) {
-            struct sockaddr_storage addr;
-            socklen_t addr_len = sizeof(addr);
-            memset(rec_buf, 0, IP_MAXPACKET);
-            bytes_ret = recvfrom(ctx.sockfd, rec_buf, IP_MAXPACKET, 0,
-                                    (struct sockaddr *)&addr, &addr_len);
-    
-            icmp = check_recv_ret(bytes_ret, rec_buf);
-            if (!icmp)
-                continue ;
-            else if (icmp->icmp_type == ICMP_ECHOREPLY) {
-                if (icmp->icmp_id != htons(getpid()))
-                    continue;
-                wait_and_prompt(bytes_ret, rec_buf, icmp);
-                stats.received++;
-                break;
-            }
-            else {
-                switch (icmp->icmp_type )
-                {
-                    case ICMP_DEST_UNREACH:
-                        printf("imcp packet :%zu\n", sizeof(icmp));
-                        break;
-                    
-                    default:
-                        break;
-                }
-            }
-        }
+        send_ping();
+        recv_pong();
+
     }
     finish_ping();
     return EXIT_SUCCESS;
@@ -496,10 +558,12 @@ int main(int ac, char **av)
 /* TODO
  * 
  *  Implement all flags :
- *  [ ] handle multiple ICMP reply type
- *      [ ] ECHO_UNREACHEABLE
- *      [ ] ECHO TIME EXCEED but after flag --ttl
+ *  [x] ECHO_UNREACHEABLE
  *  [ ] *-ttl* flag set time to live, mandatory pour traceroute             
+ *      [ ] ECHO TIME EXCEED 
  *  [ ] *-v* flag verbose
  *      [ ] horrible
+ * [ ] separate prompt wait and stats
+ *  [ ] Get same output for -f than real ping
+ * 
  */
