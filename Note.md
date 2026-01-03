@@ -44,5 +44,8 @@
 
 https://ekman.cx/articles/icmp_sockets/
 
-ip route del default = pas de route reseau 
-iptables -A OUTPUT -d 8.8.8.8 -j REJECT --reject-with icmp-net-unreachable = paquet qui revient avec l'erreur icmp-unreachable
+-   pas de route reseau 
+ip route del default 
+
+-   paquet qui revient avec l'erreur icmp-unreachable
+iptables -A OUTPUT -d 8.8.8.8 -j REJECT --reject-with icmp-net-unreachable

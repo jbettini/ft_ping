@@ -2,7 +2,7 @@ FROM ubuntu:latest
 
 RUN apt-get update && apt-get install -y \
     build-essential \
-    iputils-ping \
+    inetutils-ping \
     iptables \
     iproute2 \
     tcpdump \
