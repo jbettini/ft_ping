@@ -232,12 +232,13 @@ static void parse_args(int ac, char **av)
                 check_value_too_big(errno == ERANGE || flags.interval > INT_MAX, optarg);
                 break;
 
-            case 'c':
+            case 'c': {
                 long count = strtol(optarg, &endptr, 10);
                 if (count < 0)
                     count = 0;
                 check_invalid_value(optarg, endptr);
                 flags.count = (errno == ERANGE ? -1 : count);
+            }
             break;
 
             case SHORT_TTL_IF:
@@ -397,7 +398,7 @@ static char *handle_imcp_error(int reply_type, int reply_code)
             reply_code == current.code)
             return current.diag;
     }
-    return "Unknow icmp error code/type.";
+    return "Unknow icmp error code/type ";
 }
 
 static inline bool is_rtt_calculable(ssize_t bytes_ret, int ip_len)
@@ -457,7 +458,10 @@ static inline void prompt_icmp_reply(
             break;
         }
         default: 
-            fprintf(stderr, "ft_ping: unknow reply type: %s", handle_imcp_error(icmp->icmp_type, icmp->icmp_code));
+            fprintf(stderr, "ft_ping: unknow reply type: %s (%d/%d) ",
+                handle_imcp_error(icmp->icmp_type, icmp->icmp_code),
+                icmp->icmp_type,
+                icmp->icmp_code);
             break;
     }
     printf("\n");
@@ -533,7 +537,7 @@ static void recv_pong(void)
         else {
             struct ip *ip = get_ip_header(rec_buf);
             int ip_len = get_ip_len(ip);
-    
+
             if (bytes_ret < ip_len + ICMP_MINLEN)
                 continue;
     
@@ -557,10 +561,9 @@ static void recv_pong(void)
                 default:
                     if (flags.verbose)
                         printf("Unrecognized ICMP type %d\n", recv_icmp->icmp_type);
-                    return;
+                    continue;
             }
             prompt_icmp_reply(recv_icmp, bytes_ret - ip_len, ip, rtt_is_calculable);
-            wait_next_ping();
             return;
         }
     }
@@ -583,6 +586,7 @@ int main(int ac, char **av)
             break;
         send_ping();
         recv_pong();
+        wait_next_ping();
     }
     finish_ping();
     return EXIT_SUCCESS;
