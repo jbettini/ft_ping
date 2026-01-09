@@ -1,8 +1,10 @@
 NAME	= ft_ping
 CC		= gcc
-CFLAGS	= -Wall -Wextra -Werror -D_DEFAULT_SOURCE
+CFLAGS	= -Wall -Wextra -Werror -D_DEFAULT_SOURCE -g 
 SRC		= ft_ping.c
 OBJ		= $(SRC:.c=.o)
+
+CFLAGS  += -fsanitize=address
 
 all: $(NAME)
 

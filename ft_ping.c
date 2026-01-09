@@ -130,7 +130,7 @@ static struct option long_options[] = {
     {"verbose",         no_argument,        0, 'v'},
     {"help",            no_argument,        0, '?'},
     {"flood",           no_argument,        0, 'f'},
-    {"numeric_only",    no_argument,        0, 'n'},
+    {"size",            required_argument,  0, 's'},
     {"interval",        required_argument,  0, 'i'},
     {"count",           required_argument,  0, 'c'},
     {"ttl",             required_argument,  0, SHORT_TTL_IF},
@@ -145,7 +145,7 @@ static void print_help(void)
     printf("\n Options valid for all request types:\n\n");
     printf("  %-28s %s\n", "-c, --count=NUMBER",    "stop after sending NUMBER packets");
     printf("  %-28s %s\n", "-i, --interval=NUMBER", "wait NUMBER seconds between sending each packet");
-    printf("  %-28s %s\n", "-n, --numeric",         "do not resolve host addresses");
+    printf("  %-28s %s\n", "-s, --size",            "use <size> as number of data bytes to be sent");
     printf("  %-28s %s\n", "    --ttl=N",           "specify N as time-to-live");
     printf("  %-28s %s\n", "-v, --verbose",         "verbose output");
 
@@ -341,7 +341,7 @@ static void fill_icmp_buffer(void)
 {
     size_t start_fill = 0;
     // fill payload data (only timestamp used actually)
-    char *data_start = ctx.icmp_buffer + sizeof(struct icmp);
+    char *data_start = ctx.icmp_buffer + ICMP_MINLEN;
     if (ctx.size_permit_rtt) {
         gettimeofday((struct timeval *)data_start, NULL);
         start_fill = sizeof(struct timeval);
@@ -403,7 +403,7 @@ static char *handle_imcp_error(int reply_type, int reply_code)
 
 static inline bool is_rtt_calculable(ssize_t bytes_ret, int ip_len)
 {
-    size_t headers_size = ip_len + sizeof(struct icmp);
+    size_t headers_size = ip_len + ICMP_MINLEN;
 
     return ((size_t)bytes_ret >= headers_size + sizeof(struct timeval) && ctx.size_permit_rtt);
 }
@@ -473,12 +473,14 @@ static void update_stats(struct icmp *icmp, bool rtt_is_calculable, uint8_t type
     if (type == ICMP_ECHOREPLY)
         stats.received++;
     if (rtt_is_calculable) {
-        struct timeval *start_time = (struct timeval *)((char *)icmp + sizeof(struct icmp));
+        struct timeval start_time;
         struct timeval end_time;
+
+        memcpy(&start_time, (char *)icmp + ICMP_MINLEN, sizeof(struct timeval));
         gettimeofday(&end_time, NULL);
     
-        stats.current_rtt = (double)(end_time.tv_sec - start_time->tv_sec) * 1e6 +
-                    (double)(end_time.tv_usec - start_time->tv_usec);
+        stats.current_rtt = (double)(end_time.tv_sec - start_time.tv_sec) * 1e6 +
+                    (double)(end_time.tv_usec - start_time.tv_usec);
         stats.rtt_sum += stats.current_rtt;
         if (stats.current_rtt < stats.rtt_min)
             stats.rtt_min = stats.current_rtt;
